@@ -109,7 +109,7 @@ func (dl *downloader) Write(p []byte) (n int, err error) {
 	// Write the range out ignoring already written chunks
 	// FIXME might stop downloading if we are ignoring chunks?
 	for err == nil && !r.IsEmpty() {
-		curr, r, present = dl.item.Rs.Find(r)
+		curr, r, present = dl.item.info.Rs.Find(r)
 		if curr.Pos != dl.offset {
 			return n, errors.New("internal error: offset of range is wrong")
 		}
@@ -125,7 +125,7 @@ func (dl *downloader) Write(p []byte) (n int, err error) {
 			// if range not present then we want to write it
 			fs.Debugf(dl.src, "write chunk offset=%d size=%d", dl.offset, curr.Size)
 			nn, err = dl.out.Write(p[:curr.Size])
-			dl.item.Rs.Insert(ranges.Range{Pos: dl.offset, Size: int64(nn)})
+			dl.item.info.Rs.Insert(ranges.Range{Pos: dl.offset, Size: int64(nn)})
 		}
 		dl.offset += int64(nn)
 		p = p[nn:]
@@ -135,7 +135,7 @@ func (dl *downloader) Write(p []byte) (n int, err error) {
 		if len(dl.waiters) > 0 {
 			newWaiters := dl.waiters[:0]
 			for _, waiter := range dl.waiters {
-				if dl.item.Rs.Present(waiter.r) {
+				if dl.item.info.Rs.Present(waiter.r) {
 					waiter.errChan <- nil
 				} else {
 					newWaiters = append(newWaiters, waiter)

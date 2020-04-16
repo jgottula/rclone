@@ -27,7 +27,7 @@ func itemAsString(c *Cache) []string {
 	defer c.itemMu.Unlock()
 	var out []string
 	for name, item := range c.item {
-		out = append(out, fmt.Sprintf("name=%q opens=%d size=%d", filepath.ToSlash(name), item.opens, item.Size))
+		out = append(out, fmt.Sprintf("name=%q opens=%d size=%d", filepath.ToSlash(name), item.opens, item.info.Size))
 	}
 	sort.Strings(out)
 	return out
@@ -67,7 +67,7 @@ func TestCacheNew(t *testing.T) {
 	item, _ := c.get("potato")
 	item2, _ := c.get("potato")
 	assert.Equal(t, item, item2)
-	assert.WithinDuration(t, time.Now(), item.ATime, time.Second)
+	assert.WithinDuration(t, time.Now(), item.info.ATime, time.Second)
 
 	// open
 	assert.Equal(t, []string{
@@ -78,13 +78,13 @@ func TestCacheNew(t *testing.T) {
 	assert.Equal(t, []string{
 		`name="potato" opens=1 size=0`,
 	}, itemAsString(c))
-	assert.WithinDuration(t, time.Now(), potato.ATime, time.Second)
+	assert.WithinDuration(t, time.Now(), potato.info.ATime, time.Second)
 	assert.Equal(t, 1, potato.opens)
 
 	// write the file
 	require.NoError(t, potato.Truncate(5))
 	atime := time.Now()
-	potato.ATime = atime
+	potato.info.ATime = atime
 	// err = ioutil.WriteFile(p, []byte("hello"), 0600)
 	// require.NoError(t, err)
 
@@ -96,7 +96,7 @@ func TestCacheNew(t *testing.T) {
 	assert.Equal(t, []string{
 		`name="potato" opens=1 size=5`,
 	}, itemAsString(c))
-	assert.True(t, atime.Equal(potato.ATime), fmt.Sprintf("%v != %v", atime, potato.ATime))
+	assert.True(t, atime.Equal(potato.info.ATime), fmt.Sprintf("%v != %v", atime, potato.info.ATime))
 
 	// try purging with file open
 	c.purgeOld(10 * time.Second)
@@ -116,7 +116,7 @@ func TestCacheNew(t *testing.T) {
 		`name="potato" opens=0 size=6`,
 	}, itemAsString(c))
 	item, _ = c.get("potato")
-	assert.WithinDuration(t, time.Now(), item.ATime, time.Second)
+	assert.WithinDuration(t, time.Now(), item.info.ATime, time.Second)
 	assert.Equal(t, 0, item.opens)
 
 	// try purging with file closed
@@ -408,7 +408,7 @@ func TestCachePurgeOverQuota(t *testing.T) {
 	// make potato2 definitely after potato
 	t1 := time.Now().Add(10 * time.Second)
 	require.NoError(t, potato2.Truncate(6))
-	potato2.ATime = t1
+	potato2.info.ATime = t1
 
 	// Check only potato removed to get below quota
 	removed = nil
@@ -439,7 +439,7 @@ func TestCachePurgeOverQuota(t *testing.T) {
 	// make potato definitely after potato2
 	t2 := t1.Add(20 * time.Second)
 	require.NoError(t, potato.Truncate(5))
-	potato.ATime = t2
+	potato.info.ATime = t2
 
 	// Check only potato2 removed to get below quota
 	removed = nil

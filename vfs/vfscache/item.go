@@ -19,20 +19,32 @@ import (
 //
 // These are written to the backing store to store status
 type Item struct {
+	// read only
+	c *Cache // cache this is part of
+
 	mu         sync.Mutex  // protect the variables
-	c          *Cache      // cache this is part of
 	name       string      // name in the VFS
 	opens      int         // number of times file is open
 	downloader *downloader // if the file is being downloaded to cache
 	o          fs.Object   // object we are caching - may be nil
 	fd         *os.File    // handle we are using to read and write to the file
 	changed    bool        // set if the item is modified
+	info       Info        // info about the file to persist to backing store
 
-	// These variables are persisted to backing store
+}
+
+// Info is persisted to backing store
+type Info struct {
 	ATime       time.Time     // last time file was accessed
 	Size        int64         // size of the cached item
 	Rs          ranges.Ranges // which parts of the file are present
 	Fingerprint string        // fingerprint of remote object
+}
+
+// clean the item after its cache file has been deleted
+func (info *Info) clean() {
+	*info = Info{}
+	info.ATime = time.Now()
 }
 
 // StoreFn is called back with an object after it has been uploaded
@@ -41,9 +53,11 @@ type StoreFn func(fs.Object)
 // newItem returns an item for the cache
 func newItem(c *Cache, name string) (item *Item) {
 	item = &Item{
-		c:     c,
-		name:  name,
-		ATime: time.Now(),
+		c:    c,
+		name: name,
+		info: Info{
+			ATime: time.Now(),
+		},
 	}
 
 	// check the cache file exists
@@ -68,17 +82,9 @@ func newItem(c *Cache, name string) (item *Item) {
 	// FIXME need to know the size from the Object not from the File
 	// FIXME need read/write intent...
 	if statErr == nil {
-		item.Size = fi.Size()
+		item.info.Size = fi.Size()
 	}
 	return item
-}
-
-// clean the item after its cache file has been deleted
-func (item *Item) clean() {
-	item.Rs = nil
-	item.Fingerprint = ""
-	item.Size = 0
-	item.ATime = time.Now()
 }
 
 // load reads an item from the disk or returns nil if not found
@@ -95,7 +101,7 @@ func (item *Item) load() (exists bool, err error) {
 	}
 	defer fs.CheckClose(in, &err)
 	decoder := json.NewDecoder(in)
-	err = decoder.Decode(&item)
+	err = decoder.Decode(&item.info)
 	if err != nil {
 		return true, errors.Wrap(err, "vfs cache item: corrupt metadata")
 	}
@@ -114,7 +120,7 @@ func (item *Item) _save() (err error) {
 	defer fs.CheckClose(out, &err)
 	encoder := json.NewEncoder(out)
 	encoder.SetIndent("", "\t")
-	err = encoder.Encode(item)
+	err = encoder.Encode(item.info)
 	if err != nil {
 		return errors.Wrap(err, "vfs cache item: failed to encode metadata")
 	}
@@ -195,7 +201,7 @@ func (item *Item) Truncate(size int64) (err error) {
 		return err
 	}
 
-	item.Size = size
+	item.info.Size = size
 	if size > oldSize {
 		// Truncate extends the file in which case all new bytes are
 		// read as zeros. In this case we must show we have written to
@@ -204,7 +210,7 @@ func (item *Item) Truncate(size int64) (err error) {
 		item.changed = true
 	} else if size < oldSize {
 		// Truncate shrinks the file so clip the downloaded ranges
-		item.Rs = item.Rs.Intersection(ranges.Range{Pos: 0, Size: size})
+		item.info.Rs = item.info.Rs.Intersection(ranges.Range{Pos: 0, Size: size})
 		item.changed = true
 	} else {
 		item.changed = item.o == nil
@@ -256,7 +262,7 @@ func (item *Item) Open(o fs.Object) (err error) {
 	// item.mu.Lock()
 	// defer item.mu.Unlock()
 
-	item.ATime = time.Now()
+	item.info.ATime = time.Now()
 	item.opens++
 
 	osPath, err := item.c.mkdir(item.name)
@@ -364,7 +370,7 @@ func (item *Item) Close(storeFn StoreFn) (err error) {
 	item.mu.Lock()
 	defer item.mu.Unlock()
 
-	item.ATime = time.Now()
+	item.info.ATime = time.Now()
 	item.opens--
 
 	if item.opens < 0 {
@@ -376,7 +382,7 @@ func (item *Item) Close(storeFn StoreFn) (err error) {
 	// Update the size on close
 	size, err := item._getSize()
 	if err == nil {
-		item.Size = size
+		item.info.Size = size
 	}
 	err = item._save()
 	if err != nil {
@@ -421,7 +427,7 @@ func (item *Item) checkObject(o fs.Object) {
 	defer item.mu.Unlock()
 
 	if o == nil {
-		if item.Fingerprint != "" {
+		if item.info.Fingerprint != "" {
 			// no remote object && local object
 			// remove local object
 			item._remove("stale (remote deleted)")
@@ -431,19 +437,19 @@ func (item *Item) checkObject(o fs.Object) {
 		}
 	} else {
 		remoteFingerprint := item.c.objectFingerprint(o)
-		fs.Debugf(item.name, "vfs cache: checking remote fingerprint %q against cached fingerprint %q", remoteFingerprint, item.Fingerprint)
-		if item.Fingerprint != "" {
+		fs.Debugf(item.name, "vfs cache: checking remote fingerprint %q against cached fingerprint %q", remoteFingerprint, item.info.Fingerprint)
+		if item.info.Fingerprint != "" {
 			// remote object && local object
-			if remoteFingerprint != item.Fingerprint {
-				fs.Debugf(item.name, "vfs cache: removing cached entry as stale (remote fingerprint %q != cached fingerprint %q)", remoteFingerprint, item.Fingerprint)
+			if remoteFingerprint != item.info.Fingerprint {
+				fs.Debugf(item.name, "vfs cache: removing cached entry as stale (remote fingerprint %q != cached fingerprint %q)", remoteFingerprint, item.info.Fingerprint)
 				item._remove("stale (remote is different)")
 			}
 		} else {
 			// remote object && no local object
 			// Set fingerprint
-			item.Fingerprint = remoteFingerprint
+			item.info.Fingerprint = remoteFingerprint
 		}
-		item.Size = o.Size()
+		item.info.Size = o.Size()
 	}
 	item.o = o
 
@@ -483,7 +489,7 @@ func (item *Item) _removeMeta(reason string) {
 //
 // call with lock held
 func (item *Item) _remove(reason string) {
-	item.clean()
+	item.info.clean()
 	item._removeFile(reason)
 	item._removeMeta(reason)
 }
@@ -519,7 +525,7 @@ func (item *Item) _present() bool {
 	if item.downloader != nil && item.downloader.running() {
 		return false
 	}
-	return item.Rs.Present(ranges.Range{Pos: 0, Size: item.Size})
+	return item.info.Rs.Present(ranges.Range{Pos: 0, Size: item.info.Size})
 }
 
 // Present returns true if the whole file has been downloaded
@@ -534,13 +540,13 @@ func (item *Item) Present() bool {
 // call with the item lock held
 func (item *Item) _ensure(offset, size int64) (err error) {
 	defer log.Trace(item.name, "offset=%d, size=%d", offset, size)("err=%v", &err)
-	if offset+size > item.Size {
-		size = item.Size - offset
+	if offset+size > item.info.Size {
+		size = item.info.Size - offset
 	}
 	r := ranges.Range{Pos: offset, Size: size}
-	present := item.Rs.Present(r)
+	present := item.info.Rs.Present(r)
 	downloader := item.downloader
-	fs.Debugf(nil, "looking for range=%+v in %+v - present %v", r, item.Rs, present)
+	fs.Debugf(nil, "looking for range=%+v in %+v - present %v", r, item.info.Rs, present)
 	if present {
 		return nil
 	}
@@ -571,7 +577,7 @@ func (item *Item) _ensure(offset, size int64) (err error) {
 // call with lock held
 func (item *Item) _written(offset, size int64) {
 	defer log.Trace(item.name, "offset=%d, size=%d", offset, size)("")
-	item.Rs.Insert(ranges.Range{Pos: offset, Size: offset + size})
+	item.info.Rs.Insert(ranges.Range{Pos: offset, Size: offset + size})
 	_ = item._save() // FIXME TOO much writing? - mark as modified???
 }
 
@@ -580,8 +586,8 @@ func (item *Item) _written(offset, size int64) {
 // call with lock held
 func (item *Item) _updateFingerprint() {
 	if item.o != nil {
-		item.Fingerprint = item.c.objectFingerprint(item.o)
-		fs.Debugf(item.o, "fingerprint now %q", item.Fingerprint)
+		item.info.Fingerprint = item.c.objectFingerprint(item.o)
+		fs.Debugf(item.o, "fingerprint now %q", item.info.Fingerprint)
 	}
 }
 
