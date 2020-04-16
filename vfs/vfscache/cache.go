@@ -23,21 +23,29 @@ import (
 	"github.com/rclone/rclone/vfs/vfscommon"
 )
 
+// NB as Cache and Item are tightly linked it is necessary to have a
+// total lock ordering between them. So Cache.mu must always be
+// taken before Item.mu to avoid deadlocks.
+//
+// Cache may call into Item but care is needed if Item calls Cache
+
 // FIXME size in cache needs to be size on disk if we have sparse files...
 
 // Cache opened files
 type Cache struct {
+	// read only - no locking needed to read these
 	fremote    fs.Fs              // fs for the remote we are caching
 	fcache     fs.Fs              // fs for the cache directory
 	fcacheMeta fs.Fs              // fs for the cache metadata directory
 	opt        *vfscommon.Options // vfs Options
 	root       string             // root of the cache directory
 	metaRoot   string             // root of the cache metadata directory
-	itemMu     sync.Mutex         // protects the following variables
-	item       map[string]*Item   // files/directories in the cache
-	used       int64              // total size of files in the cache
 	hashType   hash.Type          // hash to use locally and remotely
 	hashOption *fs.HashesOption   // corresponding OpenOption
+
+	mu   sync.Mutex       // protects the following variables
+	item map[string]*Item // files/directories in the cache
+	used int64            // total size of files in the cache
 }
 
 // New creates a new cache heirachy for fremote
@@ -169,7 +177,7 @@ func (c *Cache) mkdir(name string) (string, error) {
 //
 // name should be a remote path not an osPath
 //
-// must be called with itemMu held
+// must be called with mu held
 func (c *Cache) _get(name string) (item *Item, found bool) {
 	item = c.item[name]
 	found = item != nil
@@ -185,18 +193,16 @@ func (c *Cache) _get(name string) (item *Item, found bool) {
 // It returns an old item if there was one or nil if not.
 //
 // name should be a remote path not an osPath
-//
-// must be called with itemMu held
 func (c *Cache) put(name string, item *Item) (oldItem *Item) {
 	name = clean(name)
-	c.itemMu.Lock()
+	c.mu.Lock()
 	oldItem = c.item[name]
 	if oldItem != item {
 		c.item[name] = item
 	} else {
 		oldItem = nil
 	}
-	c.itemMu.Unlock()
+	c.mu.Unlock()
 	return oldItem
 }
 
@@ -205,8 +211,8 @@ func (c *Cache) put(name string, item *Item) (oldItem *Item) {
 // name should be a remote path not an osPath
 func (c *Cache) Opens(name string) int {
 	name = clean(name)
-	c.itemMu.Lock()
-	defer c.itemMu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	item := c.item[name]
 	if item == nil {
 		return 0
@@ -224,9 +230,9 @@ func (c *Cache) Opens(name string) int {
 // name should be a remote path not an osPath
 func (c *Cache) get(name string) (item *Item, found bool) {
 	name = clean(name)
-	c.itemMu.Lock()
+	c.mu.Lock()
 	item, found = c._get(name)
-	c.itemMu.Unlock()
+	c.mu.Unlock()
 	return item, found
 }
 
@@ -303,12 +309,12 @@ func (c *Cache) Rename(name string, newName string, newObj fs.Object) (err error
 	}
 
 	// Move the item in the cache
-	c.itemMu.Lock()
+	c.mu.Lock()
 	if item, ok := c.item[name]; ok {
 		c.item[newName] = item
 		delete(c.item, name)
 	}
-	c.itemMu.Unlock()
+	c.mu.Unlock()
 
 	fs.Infof(name, "Renamed in cache to %q", newName)
 	return nil
@@ -389,8 +395,8 @@ func (c *Cache) purgeOld(maxAge time.Duration) {
 }
 
 func (c *Cache) _purgeOld(maxAge time.Duration, remove func(item *Item)) {
-	c.itemMu.Lock()
-	defer c.itemMu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	cutoff := time.Now().Add(-maxAge)
 	for name, item := range c.item {
 		item.mu.Lock()
@@ -450,8 +456,8 @@ func (c *Cache) purgeOverQuota(quota int64) {
 
 // updateUsed updates c.used so it is accurate
 func (c *Cache) updateUsed() {
-	c.itemMu.Lock()
-	defer c.itemMu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	newUsed := int64(0)
 	for _, item := range c.item {
@@ -466,8 +472,8 @@ func (c *Cache) updateUsed() {
 func (c *Cache) _purgeOverQuota(quota int64, remove func(item *Item)) {
 	c.updateUsed()
 
-	c.itemMu.Lock()
-	defer c.itemMu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	if quota <= 0 || c.used < quota {
 		return
@@ -508,9 +514,9 @@ func (c *Cache) clean() {
 		return
 	}
 
-	c.itemMu.Lock()
+	c.mu.Lock()
 	oldItems, oldUsed := len(c.item), fs.SizeSuffix(c.used)
-	c.itemMu.Unlock()
+	c.mu.Unlock()
 
 	// Remove any files that are over age
 	c.purgeOld(c.opt.CacheMaxAge)
@@ -520,9 +526,9 @@ func (c *Cache) clean() {
 	c.purgeOverQuota(int64(c.opt.CacheMaxSize))
 
 	// Stats
-	c.itemMu.Lock()
+	c.mu.Lock()
 	newItems, newUsed := len(c.item), fs.SizeSuffix(c.used)
-	c.itemMu.Unlock()
+	c.mu.Unlock()
 
 	fs.Infof(nil, "Cleaned the cache: objects %d (was %d), total size %v (was %v)", newItems, oldItems, newUsed, oldUsed)
 }
@@ -565,12 +571,7 @@ func copyObj(f fs.Fs, dst fs.Object, remote string, src fs.Object) (newDst fs.Ob
 func (c *Cache) Check(ctx context.Context, o fs.Object, remote string) (err error) {
 	defer log.Trace(o, "remote=%q", remote)("err=%v", &err)
 	item, _ := c.get(remote)
-	item.checkObject(o)
-	err = item.truncateToCurrentSize()
-	if err != nil {
-		return errors.Wrap(err, "Check truncate failed")
-	}
-	return nil
+	return item.checkObject(o)
 }
 
 /*
@@ -585,10 +586,10 @@ func (c *Cache) Fetch(ctx context.Context, o fs.Object, remote string) (err erro
 	// 	if err != nil {
 	// 		return err
 	// 	}
-	// 	c.itemMu.Lock()
+	// 	c.mu.Lock()
 	// 	item.Size = o.Size()
 	// 	item.Rs.Insert(ranges.Range{Pos: 0, Size: item.Size}) // FIXME
-	// 	c.itemMu.Unlock()
+	// 	c.mu.Unlock()
 	// }
 
 	// if cached item is present and up to date then carry on

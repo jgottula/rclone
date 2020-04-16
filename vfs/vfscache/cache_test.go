@@ -23,8 +23,8 @@ func TestMain(m *testing.M) {
 
 // convert c.item to a string
 func itemAsString(c *Cache) []string {
-	c.itemMu.Lock()
-	defer c.itemMu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	var out []string
 	for name, item := range c.item {
 		out = append(out, fmt.Sprintf("name=%q opens=%d size=%d", filepath.ToSlash(name), item.opens, item.info.Size))

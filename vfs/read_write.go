@@ -56,6 +56,8 @@ func newRWFileHandle(d *Dir, f *File, flags int) (fh *RWFileHandle, err error) {
 		if err != nil {
 			return nil, errors.Wrap(err, "cache open with O_TRUNC: failed to truncate")
 		}
+		// we definitely need to write back the item even if we don't write to it
+		item.Dirty()
 	}
 
 	if !fh.readOnly() {

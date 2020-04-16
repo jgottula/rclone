@@ -15,6 +15,26 @@ import (
 	"github.com/rclone/rclone/lib/ranges"
 )
 
+// NB as Cache and Item are tightly linked it is necessary to have a
+// total lock ordering between them. So Cache.mu must always be
+// taken before Item.mu to avoid deadlocks.
+//
+// Cache may call into Item but care is needed if Item calls Cache
+//
+// A lot of the Cache methods do not require locking, these include
+//
+// - Cache.toOSPath
+// - Cache.toOSPathMeta
+// - Cache.mkdir
+// - Cache.objectFingerprint
+
+// NB Item and downloader are tightly linked so it is necessary to
+// have a total lock ordering between them. downloader.mu must always
+// be taken before Item.mu. downloader may call into Item but Item may
+// **not** call downloader methods with Item.mu held, except for
+//
+// - downloader.running
+
 // Item is stored in the item map
 //
 // These are written to the backing store to store status
@@ -91,7 +111,7 @@ func newItem(c *Cache, name string) (item *Item) {
 func (item *Item) load() (exists bool, err error) {
 	item.mu.Lock()
 	defer item.mu.Unlock()
-	osPathMeta := item.c.toOSPathMeta(item.name)
+	osPathMeta := item.c.toOSPathMeta(item.name) // No locking in Cache
 	in, err := os.Open(osPathMeta)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -112,7 +132,7 @@ func (item *Item) load() (exists bool, err error) {
 //
 // call with the lock held
 func (item *Item) _save() (err error) {
-	osPathMeta := item.c.toOSPathMeta(item.name)
+	osPathMeta := item.c.toOSPathMeta(item.name) // No locking in Cache
 	out, err := os.Create(osPathMeta)
 	if err != nil {
 		return errors.Wrap(err, "vfs cache item: failed to write metadata")
@@ -130,7 +150,9 @@ func (item *Item) _save() (err error) {
 // truncate the item to the given size, creating it if necessary
 //
 // this does not mark the object as dirty
-func (item *Item) truncate(size int64) (err error) {
+//
+// call with the lock held
+func (item *Item) _truncate(size int64) (err error) {
 	if size < 0 {
 		// FIXME ignore unknown length files
 		return nil
@@ -139,7 +161,7 @@ func (item *Item) truncate(size int64) (err error) {
 	// Use open handle if available
 	fd := item.fd
 	if fd == nil {
-		osPath := item.c.toOSPath(item.name)
+		osPath := item.c.toOSPath(item.name) // No locking in Cache
 		fd, err = file.OpenFile(osPath, os.O_CREATE|os.O_WRONLY, 0600)
 		if err != nil {
 			return errors.Wrap(err, "vfs item truncate: failed to open cache file")
@@ -160,14 +182,18 @@ func (item *Item) truncate(size int64) (err error) {
 		return errors.Wrap(err, "vfs truncate: failed to truncate")
 	}
 
+	item.info.Size = size
+
 	return nil
 }
 
 // Truncate the item to the current size, creating if necessary
 //
 // This does not mark the object as dirty
-func (item *Item) truncateToCurrentSize() (err error) {
-	size, err := item.GetSize()
+//
+// call with the lock held
+func (item *Item) _truncateToCurrentSize() (err error) {
+	size, err := item._getSize()
 	if err != nil && !os.IsNotExist(errors.Cause(err)) {
 		return errors.Wrap(err, "truncate to current size")
 	}
@@ -175,7 +201,11 @@ func (item *Item) truncateToCurrentSize() (err error) {
 		// FIXME ignore unknown length files
 		return nil
 	}
-	return item.Truncate(size)
+	err = item._truncate(size)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // Truncate the item to the given size, creating it if necessary
@@ -187,8 +217,11 @@ func (item *Item) truncateToCurrentSize() (err error) {
 // extended and the extended data will be filled with zeros. The
 // object will be marked as dirty in this case also.
 func (item *Item) Truncate(size int64) (err error) {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+
 	// Read old size
-	oldSize, err := item.GetSize()
+	oldSize, err := item._getSize()
 	if err != nil {
 		if !os.IsNotExist(errors.Cause(err)) {
 			return errors.Wrap(err, "truncate failed to read size")
@@ -196,12 +229,11 @@ func (item *Item) Truncate(size int64) (err error) {
 		oldSize = 0
 	}
 
-	err = item.truncate(size)
+	err = item._truncate(size)
 	if err != nil {
 		return err
 	}
 
-	item.info.Size = size
 	if size > oldSize {
 		// Truncate extends the file in which case all new bytes are
 		// read as zeros. In this case we must show we have written to
@@ -227,7 +259,7 @@ func (item *Item) _getSize() (size int64, err error) {
 	if item.fd != nil {
 		fi, err = item.fd.Stat()
 	} else {
-		osPath := item.c.toOSPath(item.name)
+		osPath := item.c.toOSPath(item.name) // No locking in Cache
 		fi, err = os.Stat(osPath)
 	}
 	if os.IsNotExist(err) {
@@ -254,27 +286,31 @@ func (item *Item) Exists() bool {
 	return err == nil
 }
 
+// Dirty marks the item as changed and needing writeback
+func (item *Item) Dirty() {
+	item.mu.Lock()
+	item.changed = true
+	item.mu.Unlock()
+}
+
 // Open the local file from the object passed in (which may be nil)
 // which implies we are about to create the file
 func (item *Item) Open(o fs.Object) (err error) {
 	defer log.Trace(o, "item=%p", item)("err=%v", &err)
-	// FIXME locking
-	// item.mu.Lock()
-	// defer item.mu.Unlock()
+	item.mu.Lock()
+	defer item.mu.Unlock()
 
 	item.info.ATime = time.Now()
 	item.opens++
 
-	osPath, err := item.c.mkdir(item.name)
+	osPath, err := item.c.mkdir(item.name) // No locking in Cache
 	if err != nil {
 		return errors.Wrap(err, "vfs cache item: open mkdir failed")
 	}
 
-	item.checkObject(o)
-
-	err = item.truncateToCurrentSize()
+	err = item._checkObject(o)
 	if err != nil {
-		return errors.Wrap(err, "vfs cache item: open truncate failed")
+		return errors.Wrap(err, "vfs cache item: check object failed")
 	}
 
 	if item.opens != 1 {
@@ -299,22 +335,28 @@ func (item *Item) Open(o fs.Object) (err error) {
 		return err
 	}
 
+	// Unlock the Item.mu so we can call some methods which take Cache.mu
+	item.mu.Unlock()
+
 	// Ensure this item is in the cache. It is possible a cache
 	// expiry has run and removed the item if it had no opens so
 	// we put it back here. If there was an item with opens
 	// already then return an error. This shouldn't happen because
 	// there should only be one vfs.File with a pointer to this
 	// item in at a time.
-	oldItem := item.c.put(item.name, item)
+	oldItem := item.c.put(item.name, item) // LOCKING in Cache method
 	if oldItem != nil {
 		oldItem.mu.Lock()
 		if oldItem.opens != 0 {
 			// Put the item back and return an error
-			item.c.put(item.name, oldItem)
+			item.c.put(item.name, oldItem) // LOCKING in Cache method
 			err = errors.Errorf("internal error: item %q already open in the cache", item.name)
 		}
 		oldItem.mu.Unlock()
 	}
+
+	// Relock the Item.mu for the return
+	item.mu.Lock()
 
 	return err
 }
@@ -352,8 +394,11 @@ func (item *Item) _store() (err error) {
 
 // Close the cache file
 func (item *Item) Close(storeFn StoreFn) (err error) {
-	defer log.Trace(item.o, "")("err=%v", &err)
-	var downloader *downloader
+	defer log.Trace(item.o, "Item.Close")("err=%v", &err)
+	var (
+		downloader *downloader
+		o          fs.Object
+	)
 	// close downloader and set item with mutex unlocked
 	defer func() {
 		if downloader != nil {
@@ -362,7 +407,7 @@ func (item *Item) Close(storeFn StoreFn) (err error) {
 				err = closeErr
 			}
 		}
-		if err == nil && storeFn != nil {
+		if err == nil && storeFn != nil && o != nil {
 			// Write the object back to the VFS layer
 			storeFn(item.o)
 		}
@@ -403,11 +448,13 @@ func (item *Item) Close(storeFn StoreFn) (err error) {
 	// if the item hasn't been changed but has been completed then
 	// set the modtime from the object
 	if !item.changed && item._present() && item.o != nil {
+		fs.Debugf(item.name, "SetModTime")
 		item._setModTime(item.o.ModTime(context.Background()))
 	}
 
 	// upload the file to backing store if changed
 	if item.changed {
+		fs.Debugf(item.name, "item changed - writeback")
 		err = item._store()
 		if err != nil {
 			fs.Errorf(item.name, "%v", err)
@@ -415,6 +462,7 @@ func (item *Item) Close(storeFn StoreFn) (err error) {
 		}
 		fs.Debugf(item.o, "transferred to remote")
 		item.changed = false
+		o = item.o
 	}
 
 	return err
@@ -422,10 +470,11 @@ func (item *Item) Close(storeFn StoreFn) (err error) {
 
 // check the fingerprint of an object and update the item or delete
 // the cached file accordingly
-func (item *Item) checkObject(o fs.Object) {
-	item.mu.Lock()
-	defer item.mu.Unlock()
-
+//
+// It ensures the file is the correct size for the object
+//
+// call with lock held
+func (item *Item) _checkObject(o fs.Object) error {
 	if o == nil {
 		if item.info.Fingerprint != "" {
 			// no remote object && local object
@@ -436,7 +485,7 @@ func (item *Item) checkObject(o fs.Object) {
 			// OK
 		}
 	} else {
-		remoteFingerprint := item.c.objectFingerprint(o)
+		remoteFingerprint := item.c.objectFingerprint(o) // No locking in Cache
 		fs.Debugf(item.name, "vfs cache: checking remote fingerprint %q against cached fingerprint %q", remoteFingerprint, item.info.Fingerprint)
 		if item.info.Fingerprint != "" {
 			// remote object && local object
@@ -453,13 +502,29 @@ func (item *Item) checkObject(o fs.Object) {
 	}
 	item.o = o
 
+	err := item._truncateToCurrentSize()
+	if err != nil {
+		return errors.Wrap(err, "vfs cache item: open truncate failed")
+	}
+
+	return nil
+}
+
+// check the fingerprint of an object and update the item or delete
+// the cached file accordingly.
+//
+// It ensures the file is the correct size for the object
+func (item *Item) checkObject(o fs.Object) error {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	return item._checkObject(o)
 }
 
 // remove the cached file
 //
 // call with lock held
 func (item *Item) _removeFile(reason string) {
-	osPath := item.c.toOSPath(item.name)
+	osPath := item.c.toOSPath(item.name) // No locking in Cache
 	err := os.Remove(osPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -474,7 +539,7 @@ func (item *Item) _removeFile(reason string) {
 //
 // call with lock held
 func (item *Item) _removeMeta(reason string) {
-	osPathMeta := item.c.toOSPathMeta(item.name)
+	osPathMeta := item.c.toOSPathMeta(item.name) // No locking in Cache
 	err := os.Remove(osPathMeta)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -511,7 +576,9 @@ func (item *Item) _newDownloader() (err error) {
 	}
 	// If downloading the object already stop the downloader and restart it
 	if item.downloader != nil {
+		item.mu.Unlock()
 		_ = item.downloader.close(nil)
+		item.mu.Lock()
 		item.downloader = nil
 	}
 	item.downloader, err = newDownloader(item, item.c.fremote, item.name, item.o)
@@ -562,7 +629,9 @@ func (item *Item) _ensure(offset, size int64) (err error) {
 	if !downloader.running() {
 		// FIXME need to make sure we start in the correct place because some of offset,size might exist
 		// FIXME this could stop an old download
+		item.mu.Unlock()
 		err = downloader.start(offset)
+		item.mu.Lock()
 		if err != nil {
 			return errors.Wrap(err, "Ensure: failed to run downloader")
 		}
@@ -586,7 +655,7 @@ func (item *Item) _written(offset, size int64) {
 // call with lock held
 func (item *Item) _updateFingerprint() {
 	if item.o != nil {
-		item.info.Fingerprint = item.c.objectFingerprint(item.o)
+		item.info.Fingerprint = item.c.objectFingerprint(item.o) // No locking in Cache
 		fs.Debugf(item.o, "fingerprint now %q", item.info.Fingerprint)
 	}
 }
@@ -595,7 +664,7 @@ func (item *Item) _updateFingerprint() {
 //
 // call with lock held
 func (item *Item) _setModTime(modTime time.Time) {
-	osPath := item.c.toOSPath(item.name)
+	osPath := item.c.toOSPath(item.name) // No locking in Cache
 	err := os.Chtimes(osPath, modTime, modTime)
 	if err != nil {
 		fs.Errorf(item.name, "Failed to set modification time of cached file: %v", err)
@@ -624,6 +693,7 @@ func (item *Item) ReadAt(b []byte, off int64) (n int, err error) {
 		return n, err
 	}
 	item.mu.Unlock()
+	// Do the reading with Item.mu unlocked
 	return item.fd.ReadAt(b, off)
 }
 
@@ -635,6 +705,7 @@ func (item *Item) WriteAt(b []byte, off int64) (n int, err error) {
 		return 0, errors.New("vfs cache item WriteAt: internal error: didn't Open file")
 	}
 	item.mu.Unlock()
+	// Do the writing with Item.mu unlocked
 	n, err = item.fd.WriteAt(b, off)
 	item.mu.Lock()
 	item._written(off, int64(n))
@@ -649,6 +720,8 @@ func (item *Item) WriteAt(b []byte, off int64) (n int, err error) {
 // this means flushing the file system's in-memory copy of recently written
 // data to disk.
 func (item *Item) Sync() error {
+	item.mu.Lock()
+	defer item.mu.Unlock()
 	if item.fd == nil {
 		return errors.New("vfs cache item sync: internal error: didn't Open file")
 	}
@@ -677,13 +750,13 @@ func (item *Item) rename(name string, newName string, newObj fs.Object) (err err
 	item.o = newObj
 
 	// Rename cache file if it exists
-	err = rename(item.c.toOSPath(name), item.c.toOSPath(newName))
+	err = rename(item.c.toOSPath(name), item.c.toOSPath(newName)) // No locking in Cache
 	if err != nil {
 		return err
 	}
 
 	// Rename meta file if it exists
-	err = rename(item.c.toOSPathMeta(name), item.c.toOSPathMeta(newName))
+	err = rename(item.c.toOSPathMeta(name), item.c.toOSPathMeta(newName)) // No locking in Cache
 	if err != nil {
 		return err
 	}

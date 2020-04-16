@@ -61,7 +61,7 @@ func newDownloader(item *Item, fcache fs.Fs, remote string, src fs.Object) (dl *
 		// do nothing
 	} else if os.IsNotExist(err) {
 		fs.Debugf(src, "creating empty file")
-		err = item.truncateToCurrentSize()
+		err = item._truncateToCurrentSize()
 		if err != nil {
 			return nil, errors.Wrap(err, "newDownloader: failed to create empty file")
 		}
