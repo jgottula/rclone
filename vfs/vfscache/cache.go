@@ -557,53 +557,9 @@ func (c *Cache) cleaner(ctx context.Context) {
 	}
 }
 
-// copy an object to or from the remote while accounting for it
-func copyObj(f fs.Fs, dst fs.Object, remote string, src fs.Object) (newDst fs.Object, err error) {
-	if operations.NeedTransfer(context.TODO(), dst, src) {
-		newDst, err = operations.Copy(context.TODO(), f, dst, remote, src)
-	} else {
-		newDst = dst
-	}
-	return newDst, err
-}
-
 // Check the local file is up to date in the cache
 func (c *Cache) Check(ctx context.Context, o fs.Object, remote string) (err error) {
 	defer log.Trace(o, "remote=%q", remote)("err=%v", &err)
 	item, _ := c.get(remote)
 	return item.checkObject(o)
 }
-
-/*
-// Fetch fetches the object to the cache file starting with offset
-func (c *Cache) Fetch(ctx context.Context, o fs.Object, remote string) (err error) {
-	defer log.Trace(o, "remote=%q", remote)("err=%v", &err)
-	item, _ := c.get(remote)
-
-	// Get the whole object
-	// if false {
-	// 	o, err := copyObj(c.fcache, nil, remote, o)
-	// 	if err != nil {
-	// 		return err
-	// 	}
-	// 	c.mu.Lock()
-	// 	item.Size = o.Size()
-	// 	item.Rs.Insert(ranges.Range{Pos: 0, Size: item.Size}) // FIXME
-	// 	c.mu.Unlock()
-	// }
-
-	// if cached item is present and up to date then carry on
-	if item.Present() {
-		fs.Debugf(o, "already have present")
-		return nil
-		// cacheObj, err := c.fcache.NewObject(ctx, remote)
-		// if err == nil && !operations.NeedTransfer(context.TODO(), cacheObj, o) {
-		// 	fs.Debugf(o, "already have present")
-		// 	return nil
-		// }
-	}
-
-	// start the downloader if not started
-	return item.newDownloader()
-}
-*/

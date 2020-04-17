@@ -11,6 +11,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/log"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/lib/file"
 	"github.com/rclone/rclone/lib/ranges"
 )
@@ -251,7 +252,7 @@ func (item *Item) Truncate(size int64) (err error) {
 	return nil
 }
 
-// _getSize gets the current size of the item
+// _getSize gets the current size of the item and updates item.info.Size
 //
 // Call with mutex held
 func (item *Item) _getSize() (size int64, err error) {
@@ -262,15 +263,18 @@ func (item *Item) _getSize() (size int64, err error) {
 		osPath := item.c.toOSPath(item.name) // No locking in Cache
 		fi, err = os.Stat(osPath)
 	}
-	if os.IsNotExist(err) {
-		if item.o != nil {
-			return item.o.Size(), nil
-		}
-	}
 	if err != nil {
-		return 0, err
+		if os.IsNotExist(err) && item.o != nil {
+			size = item.o.Size()
+			err = nil
+		}
+	} else {
+		size = fi.Size()
 	}
-	return fi.Size(), err
+	if err == nil {
+		item.info.Size = size
+	}
+	return size, err
 }
 
 // GetSize gets the current size of the item
@@ -370,7 +374,7 @@ func (item *Item) _store() (err error) {
 	ctx := context.Background()
 
 	// Ensure any segments not transferred are brought in
-	err = item._ensure(0, 0x7fffffffffffffff) // FIXME Size?
+	err = item._ensure(0, item.info.Size)
 	if err != nil {
 		return errors.Wrap(err, "vfs cache: failed to download missing parts of cache file")
 	}
@@ -380,11 +384,8 @@ func (item *Item) _store() (err error) {
 	if err != nil {
 		return errors.Wrap(err, "vfs cache: failed to find cache file")
 	}
-	// FIXME why?
-	// if objOld != nil {
-	// 	remote = objOld.Remote() // use the path of the actual object if available
-	// }
-	o, err := copyObj(item.c.fremote, item.o, item.name, cacheObj)
+
+	o, err := operations.Copy(context.TODO(), item.c.fremote, item.o, item.name, cacheObj)
 	if err != nil {
 		return errors.Wrap(err, "vfs cache: failed to transfer file from cache to remote")
 	}
@@ -425,10 +426,7 @@ func (item *Item) Close(storeFn StoreFn) (err error) {
 	}
 
 	// Update the size on close
-	size, err := item._getSize()
-	if err == nil {
-		item.info.Size = size
-	}
+	_, _ = item._getSize()
 	err = item._save()
 	if err != nil {
 		return errors.Wrap(err, "close failed to save item")
