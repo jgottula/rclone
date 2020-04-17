@@ -49,23 +49,45 @@ type Item struct {
 	downloader *downloader // if the file is being downloaded to cache
 	o          fs.Object   // object we are caching - may be nil
 	fd         *os.File    // handle we are using to read and write to the file
-	changed    bool        // set if the item is modified
+	metaDirty  bool        // set if the info needs writeback
 	info       Info        // info about the file to persist to backing store
 
 }
 
 // Info is persisted to backing store
 type Info struct {
+	ModTime     time.Time     // last time file was modified
 	ATime       time.Time     // last time file was accessed
-	Size        int64         // size of the cached item
+	Size        int64         // size of the file
 	Rs          ranges.Ranges // which parts of the file are present
 	Fingerprint string        // fingerprint of remote object
+	Dirty       bool          // set if the backing file has been modifed
+}
+
+// Items are a slice of *Item ordered by ATime
+type Items []*Item
+
+func (v Items) Len() int      { return len(v) }
+func (v Items) Swap(i, j int) { v[i], v[j] = v[j], v[i] }
+func (v Items) Less(i, j int) bool {
+	if i == j {
+		return false
+	}
+	iItem := v[i]
+	jItem := v[j]
+	iItem.mu.Lock()
+	defer iItem.mu.Unlock()
+	jItem.mu.Lock()
+	defer jItem.mu.Unlock()
+
+	return iItem.info.ATime.Before(jItem.info.ATime)
 }
 
 // clean the item after its cache file has been deleted
 func (info *Info) clean() {
 	*info = Info{}
-	info.ATime = time.Now()
+	info.ModTime = time.Now()
+	info.ATime = info.ModTime
 }
 
 // StoreFn is called back with an object after it has been uploaded
@@ -73,11 +95,13 @@ type StoreFn func(fs.Object)
 
 // newItem returns an item for the cache
 func newItem(c *Cache, name string) (item *Item) {
+	now := time.Now()
 	item = &Item{
 		c:    c,
 		name: name,
 		info: Info{
-			ATime: time.Now(),
+			ModTime: now,
+			ATime:   now,
 		},
 	}
 
@@ -100,12 +124,35 @@ func newItem(c *Cache, name string) (item *Item) {
 		item._remove(fmt.Sprintf("failed to load metadata: %v", err))
 	}
 
-	// FIXME need to know the size from the Object not from the File
-	// FIXME need read/write intent...
+	// Get size estimate (which is best we can do until Open() called)
 	if statErr == nil {
 		item.info.Size = fi.Size()
 	}
 	return item
+}
+
+// inUse returns true if the item is open or dirty
+func (item *Item) inUse() bool {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	return item.opens != 0 || item.metaDirty || item.info.Dirty
+}
+
+// getATime returns the ATime of the item
+func (item *Item) getATime() time.Time {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	return item.info.ATime
+}
+
+// getDiskSize returns the size on disk (approximately) of the item
+//
+// We return the sizes of the chunks we have fetched, however there is
+// likely to be some overhead which we are not taking into account.
+func (item *Item) getDiskSize() int64 {
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	return item.info.Rs.Size()
 }
 
 // load reads an item from the disk or returns nil if not found
@@ -126,6 +173,7 @@ func (item *Item) load() (exists bool, err error) {
 	if err != nil {
 		return true, errors.Wrap(err, "vfs cache item: corrupt metadata")
 	}
+	item.metaDirty = false
 	return true, nil
 }
 
@@ -145,6 +193,7 @@ func (item *Item) _save() (err error) {
 	if err != nil {
 		return errors.Wrap(err, "vfs cache item: failed to encode metadata")
 	}
+	item.metaDirty = false
 	return nil
 }
 
@@ -235,18 +284,20 @@ func (item *Item) Truncate(size int64) (err error) {
 		return err
 	}
 
+	changed := true
 	if size > oldSize {
 		// Truncate extends the file in which case all new bytes are
 		// read as zeros. In this case we must show we have written to
 		// the new parts of the file.
 		item._written(oldSize, size)
-		item.changed = true
 	} else if size < oldSize {
 		// Truncate shrinks the file so clip the downloaded ranges
 		item.info.Rs = item.info.Rs.Intersection(ranges.Range{Pos: 0, Size: size})
-		item.changed = true
 	} else {
-		item.changed = item.o == nil
+		changed = item.o == nil
+	}
+	if changed {
+		item._dirty()
 	}
 
 	return nil
@@ -284,16 +335,42 @@ func (item *Item) GetSize() (size int64, err error) {
 	return item._getSize()
 }
 
+// _exists returns whether the backing file for the item exists or not
+//
+// call with mutex held
+func (item *Item) _exists() bool {
+	osPath := item.c.toOSPath(item.name) // No locking in Cache
+	_, err := os.Stat(osPath)
+	return err == nil
+}
+
 // Exists returns whether the backing file for the item exists or not
 func (item *Item) Exists() bool {
-	_, err := item.GetSize()
-	return err == nil
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	return item._exists()
+}
+
+// _dirty marks the item as changed and needing writeback
+//
+// call with lock held
+func (item *Item) _dirty() {
+	item.info.ModTime = time.Now()
+	item.info.ATime = item.info.ModTime
+	item.metaDirty = true
+	if !item.info.Dirty {
+		item.info.Dirty = true
+		err := item._save()
+		if err != nil {
+			fs.Errorf(item.name, "vfs cache: failed to save item info: %v", err)
+		}
+	}
 }
 
 // Dirty marks the item as changed and needing writeback
 func (item *Item) Dirty() {
 	item.mu.Lock()
-	item.changed = true
+	item._dirty()
 	item.mu.Unlock()
 }
 
@@ -385,11 +462,12 @@ func (item *Item) _store() (err error) {
 		return errors.Wrap(err, "vfs cache: failed to find cache file")
 	}
 
-	o, err := operations.Copy(context.TODO(), item.c.fremote, item.o, item.name, cacheObj)
+	o, err := operations.Copy(ctx, item.c.fremote, item.o, item.name, cacheObj)
 	if err != nil {
 		return errors.Wrap(err, "vfs cache: failed to transfer file from cache to remote")
 	}
 	item.o = o
+	item._updateFingerprint()
 	return nil
 }
 
@@ -444,14 +522,17 @@ func (item *Item) Close(storeFn StoreFn) (err error) {
 	item.fd = nil
 
 	// if the item hasn't been changed but has been completed then
-	// set the modtime from the object
-	if !item.changed && item._present() && item.o != nil {
-		fs.Debugf(item.name, "SetModTime")
-		item._setModTime(item.o.ModTime(context.Background()))
+	// set the modtime from the object otherwise set it from the info
+	if item._exists() {
+		if !item.info.Dirty && item.o != nil {
+			item._setModTime(item.o.ModTime(context.Background()))
+		} else {
+			item._setModTime(item.info.ModTime)
+		}
 	}
 
 	// upload the file to backing store if changed
-	if item.changed {
+	if item.info.Dirty {
 		fs.Debugf(item.name, "item changed - writeback")
 		err = item._store()
 		if err != nil {
@@ -459,7 +540,7 @@ func (item *Item) Close(storeFn StoreFn) (err error) {
 			return err
 		}
 		fs.Debugf(item.o, "transferred to remote")
-		item.changed = false
+		item.info.Dirty = false
 		o = item.o
 	}
 
@@ -495,6 +576,7 @@ func (item *Item) _checkObject(o fs.Object) error {
 			// remote object && no local object
 			// Set fingerprint
 			item.info.Fingerprint = remoteFingerprint
+			item.metaDirty = true
 		}
 		item.info.Size = o.Size()
 	}
@@ -553,6 +635,7 @@ func (item *Item) _removeMeta(reason string) {
 // call with lock held
 func (item *Item) _remove(reason string) {
 	item.info.clean()
+	item.metaDirty = false
 	item._removeFile(reason)
 	item._removeMeta(reason)
 }
@@ -593,14 +676,7 @@ func (item *Item) _present() bool {
 	return item.info.Rs.Present(ranges.Range{Pos: 0, Size: item.info.Size})
 }
 
-// Present returns true if the whole file has been downloaded
-func (item *Item) Present() bool {
-	item.mu.Lock()
-	defer item.mu.Unlock()
-	return item._present()
-}
-
-// ensure the range from offset, size is present
+// ensure the range from offset, size is present in the backing file
 //
 // call with the item lock held
 func (item *Item) _ensure(offset, size int64) (err error) {
@@ -639,22 +715,30 @@ func (item *Item) _ensure(offset, size int64) (err error) {
 	return item.downloader.ensure(r)
 }
 
-// _written shows the range from offset, size is now present
+// _written marks the (offset, size) as present in the backing file
+//
+// This is called by the downloader downloading file segments and the
+// vfs layer writing to the file.
 //
 // call with lock held
 func (item *Item) _written(offset, size int64) {
 	defer log.Trace(item.name, "offset=%d, size=%d", offset, size)("")
 	item.info.Rs.Insert(ranges.Range{Pos: offset, Size: offset + size})
-	_ = item._save() // FIXME TOO much writing? - mark as modified???
+	item.metaDirty = true
 }
 
 // update the fingerprint of the object if any
 //
 // call with lock held
 func (item *Item) _updateFingerprint() {
-	if item.o != nil {
-		item.info.Fingerprint = item.c.objectFingerprint(item.o) // No locking in Cache
+	if item.o == nil {
+		return
+	}
+	oldFingerprint := item.info.Fingerprint
+	item.info.Fingerprint = item.c.objectFingerprint(item.o) // No locking in Cache
+	if oldFingerprint != item.info.Fingerprint {
 		fs.Debugf(item.o, "fingerprint now %q", item.info.Fingerprint)
+		item.metaDirty = true
 	}
 }
 
@@ -662,6 +746,7 @@ func (item *Item) _updateFingerprint() {
 //
 // call with lock held
 func (item *Item) _setModTime(modTime time.Time) {
+	fs.Debugf(item.name, "vfs cache: setting modification time to %v", modTime)
 	osPath := item.c.toOSPath(item.name) // No locking in Cache
 	err := os.Chtimes(osPath, modTime, modTime)
 	if err != nil {
@@ -690,6 +775,7 @@ func (item *Item) ReadAt(b []byte, off int64) (n int, err error) {
 		item.mu.Unlock()
 		return n, err
 	}
+	item.info.ATime = time.Now()
 	item.mu.Unlock()
 	// Do the reading with Item.mu unlocked
 	return item.fd.ReadAt(b, off)
@@ -708,7 +794,7 @@ func (item *Item) WriteAt(b []byte, off int64) (n int, err error) {
 	item.mu.Lock()
 	item._written(off, int64(n))
 	if n > 0 {
-		item.changed = true
+		item._dirty()
 	}
 	item.mu.Unlock()
 	return n, err
@@ -717,13 +803,22 @@ func (item *Item) WriteAt(b []byte, off int64) (n int, err error) {
 // Sync commits the current contents of the file to stable storage. Typically,
 // this means flushing the file system's in-memory copy of recently written
 // data to disk.
-func (item *Item) Sync() error {
+func (item *Item) Sync() (err error) {
 	item.mu.Lock()
 	defer item.mu.Unlock()
 	if item.fd == nil {
 		return errors.New("vfs cache item sync: internal error: didn't Open file")
 	}
-	return nil // FIXME sync the file? Or sync to backing store?
+	// sync the file and the metadata to disk
+	err = item.fd.Sync()
+	if err != nil {
+		return errors.Wrap(err, "vfs cache item sync: failed to sync file")
+	}
+	err = item._save()
+	if err != nil {
+		return errors.Wrap(err, "vfs cache item sync: failed to sync metadata")
+	}
+	return nil
 }
 
 // rename the item

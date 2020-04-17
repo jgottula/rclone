@@ -206,20 +206,18 @@ func (c *Cache) put(name string, item *Item) (oldItem *Item) {
 	return oldItem
 }
 
-// Opens returns the number of opens that are on the file
+// InUse returns whether the name is in use in the cache
 //
 // name should be a remote path not an osPath
-func (c *Cache) Opens(name string) int {
+func (c *Cache) InUse(name string) bool {
 	name = clean(name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	item := c.item[name]
 	if item == nil {
-		return 0
+		return false
 	}
-	item.mu.Lock()
-	defer item.mu.Unlock()
-	return item.opens
+	return item.inUse()
 }
 
 // get gets a file name from the cache or creates a new one
@@ -389,8 +387,7 @@ func (c *Cache) reload() error {
 // purgeOld gets rid of any files that are over age
 func (c *Cache) purgeOld(maxAge time.Duration) {
 	c._purgeOld(maxAge, func(item *Item) {
-		// Note item.mu is held here
-		item._remove("too old")
+		item.remove("too old")
 	})
 }
 
@@ -399,18 +396,16 @@ func (c *Cache) _purgeOld(maxAge time.Duration, remove func(item *Item)) {
 	defer c.mu.Unlock()
 	cutoff := time.Now().Add(-maxAge)
 	for name, item := range c.item {
-		item.mu.Lock()
-		if item.opens == 0 {
+		if !item.inUse() {
 			// If not locked and access time too long ago - delete the file
-			dt := item.info.ATime.Sub(cutoff)
-			// fs.Debugf(name, "atime=%v cutoff=%v, dt=%v", item.ATime, cutoff, dt)
+			dt := item.getATime().Sub(cutoff)
+			// fs.Debugf(name, "atime=%v cutoff=%v, dt=%v", item.info.ATime, cutoff, dt)
 			if dt < 0 {
 				remove(item)
 				// Remove the entry
 				delete(c.item, name)
 			}
 		}
-		item.mu.Unlock()
 	}
 }
 
@@ -427,30 +422,11 @@ func (c *Cache) purgeEmptyDirs() {
 	}
 }
 
-type cacheItems []*Item
-
-func (v cacheItems) Len() int      { return len(v) }
-func (v cacheItems) Swap(i, j int) { v[i], v[j] = v[j], v[i] }
-func (v cacheItems) Less(i, j int) bool {
-	if i == j {
-		return false
-	}
-	iItem := v[i]
-	jItem := v[j]
-	iItem.mu.Lock()
-	defer iItem.mu.Unlock()
-	jItem.mu.Lock()
-	defer jItem.mu.Unlock()
-
-	return iItem.info.ATime.Before(jItem.info.ATime)
-}
-
 // Remove any files that are over quota starting from the
 // oldest first
 func (c *Cache) purgeOverQuota(quota int64) {
 	c._purgeOverQuota(quota, func(item *Item) {
-		// Note item.mu is held here
-		item._remove("over quota")
+		item.remove("over quota")
 	})
 }
 
@@ -461,10 +437,7 @@ func (c *Cache) updateUsed() {
 
 	newUsed := int64(0)
 	for _, item := range c.item {
-		item.mu.Lock()
-		newUsed += item.info.Size // FIXME make this size on disk
-		item.mu.Unlock()
-
+		newUsed += item.getDiskSize()
 	}
 	c.used = newUsed
 }
@@ -479,15 +452,13 @@ func (c *Cache) _purgeOverQuota(quota int64, remove func(item *Item)) {
 		return
 	}
 
-	var items cacheItems
+	var items Items
 
 	// Make a slice of unused files
 	for _, item := range c.item {
-		item.mu.Lock()
-		if item.opens == 0 {
+		if !item.inUse() {
 			items = append(items, item)
 		}
-		item.mu.Unlock()
 	}
 
 	sort.Sort(items)
@@ -497,12 +468,10 @@ func (c *Cache) _purgeOverQuota(quota int64, remove func(item *Item)) {
 		if c.used < quota {
 			break
 		}
-		item.mu.Lock()
-		c.used -= item.info.Size // FIXME size on disk
+		c.used -= item.getDiskSize()
 		remove(item)
 		// Remove the entry
 		delete(c.item, item.name)
-		item.mu.Unlock()
 	}
 }
 
