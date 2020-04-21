@@ -454,6 +454,26 @@ func TestCacheInUse(t *testing.T) {
 	assert.False(t, c.InUse("potato"))
 }
 
+func TestCacheDirtyItem(t *testing.T) {
+	_, c, cleanup := newTestCache(t)
+	defer cleanup()
+
+	assert.Nil(t, c.DirtyItem("potato"))
+
+	potato := c.Item("potato")
+
+	assert.Nil(t, c.DirtyItem("potato"))
+
+	require.NoError(t, potato.Open(nil))
+	require.NoError(t, potato.Truncate(5))
+
+	assert.Equal(t, potato, c.DirtyItem("potato"))
+
+	require.NoError(t, potato.Close(nil))
+
+	assert.Nil(t, c.DirtyItem("potato"))
+}
+
 func TestCacheExistsAndRemove(t *testing.T) {
 	_, c, cleanup := newTestCache(t)
 	defer cleanup()
@@ -551,4 +571,73 @@ func TestCacheCleaner(t *testing.T) {
 	potato2, found = c.get("potato")
 	assert.NotEqual(t, potato, potato2)
 	assert.False(t, found)
+}
+
+func TestCacheSetModTime(t *testing.T) {
+	_, c, cleanup := newTestCache(t)
+	defer cleanup()
+
+	t1 := time.Date(2010, 1, 2, 3, 4, 5, 9, time.UTC)
+
+	potato := c.Item("potato")
+	require.NoError(t, potato.Open(nil))
+	require.NoError(t, potato.Truncate(5))
+	require.NoError(t, potato.Close(nil))
+
+	c.SetModTime("potato", t1)
+	osPath := potato.c.toOSPath("potato")
+	fi, err := os.Stat(osPath)
+	require.NoError(t, err)
+
+	fstest.AssertTimeEqualWithPrecision(t, "potato", t1, fi.ModTime(), time.Second)
+}
+
+func TestCacheTotaInUse(t *testing.T) {
+	_, c, cleanup := newTestCache(t)
+	defer cleanup()
+
+	assert.Equal(t, int(0), c.TotalInUse())
+
+	potato := c.Item("potato")
+	assert.Equal(t, int(0), c.TotalInUse())
+
+	require.NoError(t, potato.Open(nil))
+	assert.Equal(t, int(1), c.TotalInUse())
+
+	require.NoError(t, potato.Truncate(5))
+	assert.Equal(t, int(1), c.TotalInUse())
+
+	potato2 := c.Item("potato2")
+	assert.Equal(t, int(1), c.TotalInUse())
+
+	require.NoError(t, potato2.Open(nil))
+	assert.Equal(t, int(2), c.TotalInUse())
+
+	require.NoError(t, potato2.Close(nil))
+	assert.Equal(t, int(1), c.TotalInUse())
+
+	require.NoError(t, potato.Close(nil))
+	assert.Equal(t, int(0), c.TotalInUse())
+}
+
+func TestCacheDump(t *testing.T) {
+	_, c, cleanup := newTestCache(t)
+	defer cleanup()
+
+	out := (*Cache)(nil).Dump()
+	assert.Equal(t, "Cache: <nil>\n", out)
+
+	out = c.Dump()
+	assert.Equal(t, "Cache{\n}\n", out)
+
+	c.Item("potato")
+
+	out = c.Dump()
+	want := "Cache{\n\t\"potato\": "
+	assert.Equal(t, want, out[:len(want)])
+
+	c.Remove("potato")
+
+	out = c.Dump()
+	assert.Equal(t, "Cache{\n}\n", out)
 }
