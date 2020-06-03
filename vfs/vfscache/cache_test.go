@@ -563,13 +563,13 @@ func TestCacheCleaner(t *testing.T) {
 
 	potato := c.Item("potato")
 	potato2, found := c.get("potato")
-	assert.Equal(t, potato, potato2)
+	assert.Equal(t, fmt.Sprintf("%p", potato), fmt.Sprintf("%p", potato2))
 	assert.True(t, found)
 
 	time.Sleep(10 * opt.CachePollInterval)
 
 	potato2, found = c.get("potato")
-	assert.NotEqual(t, potato, potato2)
+	assert.NotEqual(t, fmt.Sprintf("%p", potato), fmt.Sprintf("%p", potato2))
 	assert.False(t, found)
 }
 
