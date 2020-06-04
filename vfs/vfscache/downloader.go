@@ -162,7 +162,7 @@ func (dl *downloader) start(offset int64) (err error) {
 	go func() {
 		err := dl.download()
 		_ = dl.close(err)
-		if err != nil && errors.Cause(err) != asyncreader.ErrorStreamAbandoned {
+		if err != nil {
 			fs.Errorf(dl.src, "Failed to download: %v", err)
 			// FIXME set an error here????
 		}
@@ -282,7 +282,7 @@ Need offset to be passed to NewReOpen
 func (dl *downloader) download() (err error) {
 	defer log.Trace(dl.src, "")("err=%v", &err)
 	_, err = dl.in.WriteTo(dl)
-	if err != nil {
+	if err != nil && errors.Cause(err) != asyncreader.ErrorStreamAbandoned {
 		return errors.Wrap(err, "vfs reader: failed to write to cache file")
 	}
 	return nil
