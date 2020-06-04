@@ -228,21 +228,21 @@ func (dl *downloader) stop() {
 	defer log.Trace(dl.src, "")("")
 
 	dl.mu.Lock()
-	if !dl.downloading || dl.in == nil {
-		dl.mu.Unlock()
+	in, downloading := dl.in, dl.downloading
+	dl.mu.Unlock()
+	if !downloading || in == nil {
 		return
 	}
 
-	// stop the downloader
-	dl.in.StopBuffering()
-	oldReader := dl.in.GetReader()
-	dl.in.UpdateReader(ioutil.NopCloser(readers.ErrorReader{Err: errStop}))
+	// stop the downloader - do this without mutex as asyncreader
+	// calls back into Write() which holds the lock
+	in.StopBuffering()
+	oldReader := in.GetReader()
+	in.UpdateReader(ioutil.NopCloser(readers.ErrorReader{Err: errStop}))
 	err := oldReader.Close()
 	if err != nil {
 		fs.Debugf(dl.src, "vfs downloader: stop close old failed: %v", err)
 	}
-
-	dl.mu.Unlock()
 
 	// wait for downloader to finish...
 	<-dl.finished
