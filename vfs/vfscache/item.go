@@ -847,7 +847,14 @@ func (item *Item) ReadAt(b []byte, off int64) (n int, err error) {
 		item.mu.Unlock()
 		return 0, errors.New("vfs cache item ReadAt: internal error: didn't Open file")
 	}
-	err = item._ensure(off, int64(len(b)))
+	// ReadAhead to the read buffer size or the --vfs-read-ahead config
+	// whichever is the larger. It is a good idea to fetch ahead here so we
+	// don't have stutters when we go from cached to uncached data.
+	toFetch := int64(item.c.opt.ReadAhead)
+	if int64(len(b)) > toFetch {
+		toFetch = int64(len(b))
+	}
+	err = item._ensure(off, toFetch)
 	if err != nil {
 		item.mu.Unlock()
 		return n, err
